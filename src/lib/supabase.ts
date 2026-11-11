@@ -1,6 +1,6 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { UserProfile, Conversation, Message, DatabaseInstance } from '../types';
-import { apiUrl } from './api';
+import { apiUrl, parseApiResponse } from './api';
 
 const rawSupabaseUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
 const supabaseUrl = /^https?:\/\//i.test(rawSupabaseUrl) ? rawSupabaseUrl : '';
@@ -57,12 +57,12 @@ export class PersistenceService {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (res.ok) {
-          const data = await res.json();
+          const data = await parseApiResponse(res, 'Session validation failed.');
           if (data?.user) {
             localStorage.setItem(STORAGE_USER, JSON.stringify(data.user));
             return data.user;
           }
-        } else {
+        } else if (res.status === 401) {
           // Token invalid or expired
           localStorage.removeItem(STORAGE_TOKEN);
           localStorage.removeItem(STORAGE_USER);

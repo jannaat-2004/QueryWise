@@ -12,7 +12,7 @@ import {
 } from './types';
 import { PersistenceService, isSupabaseConfigured } from './lib/supabase';
 import { SQLiteEngine } from './lib/sqlite-engine';
-import { apiUrl } from './lib/api';
+import { apiUrl, parseApiResponse } from './lib/api';
 import { validateSqlSemantics, synthesizeGroupedOrOverallSql } from './lib/sql-semantics';
 import { ThreeBackground } from './components/ThreeBackground';
 import { Navbar } from './components/Navbar';
@@ -622,11 +622,10 @@ export default function App() {
         })
       });
 
-      if (!processRes.ok) {
-        throw new Error('Failed to communicate with AI query processor');
-      }
-
-      const processData = await processRes.json();
+      const processData = await parseApiResponse(
+        processRes,
+        'Failed to communicate with AI query processor.'
+      );
       const intent: AIIntent = processData.intent || 'DATA_QUERY';
 
       // 2. Handle Greeting, Clarification, or SQL Explanation when no SQL execution is required
@@ -748,7 +747,7 @@ export default function App() {
               })
             });
             if (repairRes.ok) {
-              const repairData = await repairRes.json();
+              const repairData = await parseApiResponse(repairRes, 'SQL repair failed.');
               if (repairData.repairedSql && repairData.repairedSql !== generatedSql) {
                 const retryResult = await SQLiteEngine.executeQuery(
                   activeDatabase.id,
@@ -804,7 +803,7 @@ export default function App() {
             })
           });
           if (interpRes.ok) {
-            const interpData = await interpRes.json();
+            const interpData = await parseApiResponse(interpRes, 'Result interpretation failed.');
             if (interpData) {
               const groundedHeadline = interpData.headline || structuredAnswer.headline;
               const observationsText = Array.isArray(interpData.observations) && interpData.observations.length > 0

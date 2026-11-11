@@ -5,14 +5,14 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/index.ts": {
+    "api/index.js": {
       "maxDuration": 30
     }
   },
   "rewrites": [
     {
-      "source": "/api/(.*)",
-      "destination": "/api/index"
+      "source": "/api/:path*",
+      "destination": "/api/index?__pathname=/:path*"
     },
     {
       "source": "/((?!api/).*)",
@@ -20,4 +20,3 @@
     }
   ]
 }
-

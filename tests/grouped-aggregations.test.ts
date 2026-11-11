@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import * as XLSX from 'xlsx';
 import { SQLiteEngine } from '../src/lib/sqlite-engine';
 import { DEMO_TEMPLATES_METADATA } from '../src/lib/demo-databases';
+import { parseApiResponse } from '../src/lib/api';
 import {
   validateSqlSemantics,
   synthesizeGroupedOrOverallSql,
@@ -395,13 +396,29 @@ async function runTests() {
   assert.equal(excelQueryRes.rows[0][0], 30900, 'Expected sum 30900 from uploaded Excel DB');
   console.log('  PASS -> Native SQLite (.db/.sqlite), CSV, and Excel (.xlsx) user database imports verified!\n');
 
-  // 12. Verify Production API Health, Auth Registration, Stateless Session & Cold-Start Account Proof
-  console.log('Test 12: Verify Production API Health, Auth Registration, Login & Stateless Session Token...');
+  // 12. Verify Complete Production Authentication Suite (All 9 Scenarios + Non-JSON Error Handling + Vercel Rewrite Path)
+  console.log('Test 12: Verify Complete Production Auth Suite (Register, Duplicate, Validation, Login, Invalid Pass, Session, Logout, Re-login, Non-JSON Error)...');
   const healthRes = await fetch(`${BASE_URL}/api/health`);
   assert.equal(healthRes.ok, true, 'Expected /api/health to return 200 OK');
-  const healthData = await healthRes.json() as any;
+  const healthData = await parseApiResponse(healthRes);
   assert.equal(healthData.status, 'ok', 'Expected health status ok');
 
+  // 12.1 Missing / Invalid Field Validation
+  const invalidEmailRes = await fetch(`${BASE_URL}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fullName: 'Test', email: 'not-an-email', password: 'Password123' })
+  });
+  assert.equal(invalidEmailRes.status, 400, 'Expected 400 for invalid email');
+
+  const shortPassRes = await fetch(`${BASE_URL}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fullName: 'Test', email: 'short@querywise.test', password: '123' })
+  });
+  assert.equal(shortPassRes.status, 400, 'Expected 400 for short password');
+
+  // 12.2 New User Registration
   const testEmail = `vercel-prod-${Date.now()}@querywise.test`;
   const testPass = 'ProdPass#2026';
   const regRes = await fetch(`${BASE_URL}/api/auth/register`, {
@@ -410,26 +427,89 @@ async function runTests() {
     body: JSON.stringify({ fullName: 'Vercel Tester', email: testEmail, password: testPass })
   });
   assert.equal(regRes.status, 201, `Expected 201 on register, got ${regRes.status}`);
-  const regData = await regRes.json() as any;
+  const regData = await parseApiResponse(regRes);
   assert.ok(regData.accountProof && regData.accountProof.startsWith('qwa1.'), 'Expected signed accountProof starting with qwa1.');
 
+  // 12.3 Duplicate Email Registration (409 Conflict)
+  const dupRegRes = await fetch(`${BASE_URL}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fullName: 'Vercel Tester', email: testEmail, password: testPass, accountProof: regData.accountProof })
+  });
+  assert.equal(dupRegRes.status, 409, `Expected 409 on duplicate email registration, got ${dupRegRes.status}`);
+
+  // 12.4 Invalid Password Handling (401 Unauthorized)
+  const badLoginRes = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: testEmail, password: 'WrongPassword999', accountProof: regData.accountProof })
+  });
+  assert.equal(badLoginRes.status, 401, `Expected 401 on wrong password, got ${badLoginRes.status}`);
+
+  // 12.5 Existing User Login & Session Creation
   const loginRes = await fetch(`${BASE_URL}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: testEmail, password: testPass, accountProof: regData.accountProof })
   });
   assert.equal(loginRes.ok, true, 'Expected /api/auth/login to succeed');
-  const loginData = await loginRes.json() as any;
+  const loginData = await parseApiResponse(loginRes);
   assert.equal(loginData.user.email, testEmail);
+  assert.equal(loginData.isFirstLogin, true, 'Expected isFirstLogin=true on first login');
   assert.ok(loginData.token && loginData.token.startsWith('qws1.'), 'Expected stateless HMAC session token starting with qws1.');
 
-  const sessRes = await fetch(`${BASE_URL}/api/auth/session`, {
+  // 12.6 Session Persistence After Refreshing Page (including Vercel rewrite path format)
+  const sessRes = await fetch(`${BASE_URL}/api/index?__pathname=/auth/session`, {
     headers: { Authorization: `Bearer ${loginData.token}` }
   });
-  assert.equal(sessRes.ok, true, 'Expected /api/auth/session to validate stateless token');
-  const sessData = await sessRes.json() as any;
+  assert.equal(sessRes.ok, true, 'Expected /api/auth/session via Vercel rewrite path to validate stateless token');
+  const sessData = await parseApiResponse(sessRes);
   assert.equal(sessData.user.email, testEmail, 'Expected matching user email from stateless session');
-  console.log('  PASS -> Production Health, Auth, Stateless Session (qws1) & Serverless Account Proof (qwa1) verified!\n');
+
+  // Complete first login so subsequent login goes directly to Dashboard
+  await fetch(`${BASE_URL}/api/auth/complete-first-login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userId: loginData.user.id })
+  });
+
+  // 12.7 Logout & Session Revocation
+  const logoutRes = await fetch(`${BASE_URL}/api/auth/logout`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${loginData.token}` }
+  });
+  assert.equal(logoutRes.ok, true, 'Expected /api/auth/logout to return 200');
+
+  const revokedSessRes = await fetch(`${BASE_URL}/api/auth/session`, {
+    headers: { Authorization: `Bearer ${loginData.token}` }
+  });
+  assert.equal(revokedSessRes.status, 401, 'Expected 401 for logged-out token');
+
+  // 12.8 Authentication After Reopening Application
+  const reloginRes = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: testEmail, password: testPass, accountProof: loginData.accountProof })
+  });
+  assert.equal(reloginRes.ok, true, 'Expected re-login after reopening app to succeed');
+  const reloginData = await parseApiResponse(reloginRes);
+  assert.equal(reloginData.user.email, testEmail);
+  assert.ok(reloginData.token && reloginData.token.startsWith('qws1.'));
+
+  // 12.9 Non-JSON Error Response Handling (Verify no "Unexpected token 'A'" SyntaxError)
+  const simulatedVercel500 = new Response(
+    'A server error has occurred\n\nFUNCTION_INVOCATION_FAILED\n',
+    { status: 500, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
+  );
+  await assert.rejects(
+    () => parseApiResponse(simulatedVercel500, 'Failed to create account.'),
+    (err: Error) => {
+      assert.ok(!err.message.includes('Unexpected token'), `Must not throw raw JSON SyntaxError: ${err.message}`);
+      assert.ok(err.message.includes('HTTP 500'), `Expected clean HTTP 500 message, got: ${err.message}`);
+      return true;
+    }
+  );
+  console.log('  PASS -> All 9 Auth Scenarios + Vercel Rewrite Routing + Non-JSON Error Handling verified!\n');
 
   console.log('==============================================================');
   console.log('ALL 17 PRODUCTION, DEMO DATABASE, UPLOAD & AGGREGATION TESTS PASSED!');

@@ -6,7 +6,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Check, Copy, Zap, BookOpen, Layers, Sparkles } from 'lucide-react';
 import { deconstructSqlClauses, ClauseExplanation } from '../lib/sql-explainer';
-import { apiUrl } from '../lib/api';
+import { apiUrl, parseApiResponse } from '../lib/api';
 
 interface SqlModalProps {
   isOpen: boolean;
@@ -70,7 +70,7 @@ export const SqlModal: React.FC<SqlModalProps> = ({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sql, schemaContext })
     })
-      .then(res => res.json())
+      .then(res => parseApiResponse(res, 'SQL analysis request failed.'))
       .then(data => {
         setResult(prev => ({
           ...prev,

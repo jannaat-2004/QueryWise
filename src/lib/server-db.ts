@@ -1,4 +1,3 @@
-import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -8,115 +7,6 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 dotenv.config({ override: true });
 
-/**
- * Resolve a writable SQLite path across local dev, Docker/Render/Railway, and Vercel Serverless (/tmp).
- * Vercel's /var/task directory is read-only; os.tmpdir() (/tmp) is writable.
- */
-function resolveWritableDatabasePath(): string {
-  const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NETLIFY);
-  if (!isServerless) {
-    try {
-      const localDataDir = path.resolve(process.cwd(), 'data');
-      if (!fs.existsSync(localDataDir)) {
-        fs.mkdirSync(localDataDir, { recursive: true });
-      }
-      const testFile = path.join(localDataDir, '.write-test');
-      fs.writeFileSync(testFile, 'ok');
-      fs.unlinkSync(testFile);
-      return path.join(localDataDir, 'querywise_auth.sqlite');
-    } catch {
-      // Fall back to os.tmpdir() if working directory is read-only
-    }
-  }
-
-  try {
-    const tmpDataDir = path.join(os.tmpdir(), 'querywise-data');
-    if (!fs.existsSync(tmpDataDir)) {
-      fs.mkdirSync(tmpDataDir, { recursive: true });
-    }
-    return path.join(tmpDataDir, 'querywise_auth.sqlite');
-  } catch {
-    return ':memory:';
-  }
-}
-
-const dbPath = resolveWritableDatabasePath();
-
-if (dbPath !== ':memory:' && !fs.existsSync(dbPath)) {
-  for (const suffix of ['-wal', '-shm']) {
-    const walPath = `${dbPath}${suffix}`;
-    if (fs.existsSync(walPath)) {
-      try {
-        fs.unlinkSync(walPath);
-      } catch {
-        // Ignore cleanup errors
-      }
-    }
-  }
-}
-
-let db: DatabaseSync;
-try {
-  db = new DatabaseSync(dbPath);
-} catch {
-  db = new DatabaseSync(':memory:');
-}
-
-// Enable WAL mode where supported
-try {
-  if (dbPath !== ':memory:') {
-    db.exec('PRAGMA journal_mode = WAL;');
-  }
-  db.exec('PRAGMA foreign_keys = ON;');
-} catch (e) {
-  console.warn('Failed to set PRAGMA on server database:', e);
-}
-
-// Initialize tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    full_name TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    onboarding_completed INTEGER DEFAULT 0,
-    first_login_completed INTEGER DEFAULT 0,
-    login_count INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS password_resets (
-    email TEXT PRIMARY KEY,
-    code TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-  CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
-`);
-
-// Dynamic column migrations for existing SQLite databases
-try {
-  db.exec('ALTER TABLE users ADD COLUMN first_login_completed INTEGER DEFAULT 0;');
-} catch {
-  // Column already exists
-}
-
-try {
-  db.exec('ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0;');
-} catch {
-  // Column already exists
-}
-
 export interface DbUser {
   id: string;
   email: string;
@@ -125,6 +15,37 @@ export interface DbUser {
   onboardingCompleted: boolean;
   firstLoginCompleted: boolean;
   loginCount: number;
+}
+
+interface StoredUserRecord {
+  id: string;
+  email: string;
+  password_hash: string;
+  password_salt: string;
+  full_name: string;
+  created_at: string;
+  onboarding_completed: number;
+  first_login_completed: number;
+  login_count: number;
+}
+
+interface StoredSessionRecord {
+  token: string;
+  user_id: string;
+  created_at: string;
+  expires_at: string;
+}
+
+interface StoredPasswordResetRecord {
+  email: string;
+  code: string;
+  expires_at: string;
+}
+
+interface AuthStoreData {
+  users: Record<string, StoredUserRecord>;
+  sessions: Record<string, StoredSessionRecord>;
+  passwordResets: Record<string, StoredPasswordResetRecord>;
 }
 
 interface SignedAccountProofPayload {
@@ -144,6 +65,86 @@ interface SignedSessionPayload {
   exp: number;
 }
 
+/**
+ * Resolve a writable JSON persistence path across local dev, Docker/Render/Railway, and Vercel Serverless (/tmp).
+ * Avoids any dependency on experimental `node:sqlite` or native C++ addons so Vercel Serverless Functions
+ * start instantaneously on Node 18, 20, 22, and 24 without `FUNCTION_INVOCATION_FAILED`.
+ */
+function resolveWritableStorePath(): string | null {
+  const isServerless = Boolean(
+    process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.NETLIFY
+  );
+
+  if (!isServerless) {
+    try {
+      const localDataDir = path.resolve(process.cwd(), 'data');
+      if (!fs.existsSync(localDataDir)) {
+        fs.mkdirSync(localDataDir, { recursive: true });
+      }
+      const testFile = path.join(localDataDir, '.write-test');
+      fs.writeFileSync(testFile, 'ok');
+      fs.unlinkSync(testFile);
+      return path.join(localDataDir, 'querywise_auth.json');
+    } catch {
+      // Fall back to os.tmpdir() if working directory is read-only
+    }
+  }
+
+  try {
+    const tmpDataDir = path.join(os.tmpdir(), 'querywise-data');
+    if (!fs.existsSync(tmpDataDir)) {
+      fs.mkdirSync(tmpDataDir, { recursive: true });
+    }
+    return path.join(tmpDataDir, 'querywise_auth.json');
+  } catch {
+    return null;
+  }
+}
+
+const storeFilePath = resolveWritableStorePath();
+
+const memoryStore: AuthStoreData = {
+  users: {},
+  sessions: {},
+  passwordResets: {}
+};
+
+function loadStoreFromDisk(): void {
+  if (!storeFilePath) return;
+  try {
+    if (fs.existsSync(storeFilePath)) {
+      const raw = fs.readFileSync(storeFilePath, 'utf8');
+      const parsed = JSON.parse(raw) as Partial<AuthStoreData>;
+      if (parsed.users && typeof parsed.users === 'object') {
+        Object.assign(memoryStore.users, parsed.users);
+      }
+      if (parsed.sessions && typeof parsed.sessions === 'object') {
+        Object.assign(memoryStore.sessions, parsed.sessions);
+      }
+      if (parsed.passwordResets && typeof parsed.passwordResets === 'object') {
+        Object.assign(memoryStore.passwordResets, parsed.passwordResets);
+      }
+    }
+  } catch {
+    // Ignore corrupted or concurrent read errors; in-memory + HMAC tokens remain authoritative
+  }
+}
+
+function saveStoreToDisk(): void {
+  if (!storeFilePath) return;
+  try {
+    fs.writeFileSync(storeFilePath, JSON.stringify(memoryStore, null, 2), 'utf8');
+  } catch {
+    // Ignore write errors on ephemeral/read-only filesystems
+  }
+}
+
+// Initial load
+loadStoreFromDisk();
+
 const revokedTokens = new Set<string>();
 
 function getSigningSecret(): string {
@@ -151,6 +152,7 @@ function getSigningSecret(): string {
     process.env.AUTH_SECRET ||
     process.env.GEMINI_API_KEY ||
     process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY ||
     'querywise-production-hmac-secret-v1'
   );
 }
@@ -217,7 +219,7 @@ const SUPABASE_URL = resolveValidSupabaseUrl();
 const SUPABASE_ANON_KEY = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
 let supabaseClient: SupabaseClient | null = null;
-if (SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY !== 'your-anon-key') {
+if (SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY !== 'your-anon-key' && SUPABASE_ANON_KEY !== 'your-supabase-anon-key') {
   try {
     supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
   } catch (e) {
@@ -225,49 +227,42 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY !== 'your-anon-key') 
   }
 }
 
+function findUserById(userId: string): StoredUserRecord | undefined {
+  loadStoreFromDisk();
+  for (const u of Object.values(memoryStore.users)) {
+    if (u.id === userId) return u;
+  }
+  return undefined;
+}
+
 export class ServerAuthDatabase {
   /**
-   * Re-hydrate a signed account proof into the local SQLite instance if cold-started on Serverless
+   * Re-hydrate a signed account proof into the store if cold-started on Serverless
    */
   static restoreAccountProofIfNeeded(accountProof?: string): void {
     if (!accountProof) return;
     const payload = verifySignedPayload<SignedAccountProofPayload>(accountProof, 'qwa1');
     if (!payload || !payload.email || !payload.passwordHash || !payload.passwordSalt) return;
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(payload.email);
-    if (!existing) {
-      try {
-        db.prepare(`
-          INSERT INTO users (id, email, password_hash, password_salt, full_name, created_at, onboarding_completed, first_login_completed, login_count)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          payload.id,
-          payload.email,
-          payload.passwordHash,
-          payload.passwordSalt,
-          payload.fullName,
-          payload.createdAt,
-          payload.onboardingCompleted ? 1 : 0,
-          payload.firstLoginCompleted ? 1 : 0,
-          payload.loginCount ?? 0
-        );
-      } catch {
-        // Ignore duplicate insert race
-      }
+    const cleanEmail = payload.email.trim().toLowerCase();
+    loadStoreFromDisk();
+    if (!memoryStore.users[cleanEmail]) {
+      memoryStore.users[cleanEmail] = {
+        id: payload.id,
+        email: cleanEmail,
+        password_hash: payload.passwordHash,
+        password_salt: payload.passwordSalt,
+        full_name: payload.fullName,
+        created_at: payload.createdAt,
+        onboarding_completed: payload.onboardingCompleted ? 1 : 0,
+        first_login_completed: payload.firstLoginCompleted ? 1 : 0,
+        login_count: payload.loginCount ?? 0
+      };
+      saveStoreToDisk();
     }
   }
 
-  private static createAccountProof(row: {
-    id: string;
-    email: string;
-    full_name: string;
-    password_hash: string;
-    password_salt: string;
-    created_at: string;
-    onboarding_completed: number;
-    first_login_completed?: number;
-    login_count?: number;
-  }): string {
+  private static createAccountProof(row: StoredUserRecord): string {
     const proofPayload: SignedAccountProofPayload = {
       id: row.id,
       email: row.email,
@@ -285,93 +280,72 @@ export class ServerAuthDatabase {
   /**
    * Register a new user in the database
    */
-  static async register(email: string, password: string, fullName: string): Promise<{ user: DbUser; token: string; accountProof: string }> {
+  static async register(
+    email: string,
+    password: string,
+    fullName: string,
+    accountProof?: string
+  ): Promise<{ user: DbUser; token: string; accountProof: string }> {
     const cleanEmail = email.trim().toLowerCase();
     const cleanName = fullName.trim() || cleanEmail.split('@')[0];
 
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      throw new Error('Valid email address is required.');
+    }
     if (!password || password.length < 6) {
       throw new Error('Password must be at least 6 characters long.');
     }
 
-    const existing = db.prepare('SELECT id, password_hash, login_count, created_at FROM users WHERE email = ?').get(cleanEmail) as {
-      id: string;
-      password_hash: string;
-      login_count: number;
-      created_at: string;
-    } | undefined;
+    loadStoreFromDisk();
+    this.restoreAccountProofIfNeeded(accountProof);
 
+    const existing = memoryStore.users[cleanEmail];
     if (existing) {
-      const { hash, salt } = hashPassword(password);
-      db.prepare('UPDATE users SET password_hash = ?, password_salt = ?, full_name = ? WHERE id = ?').run(
-        hash,
-        salt,
-        cleanName,
-        existing.id
-      );
-      const userObj: DbUser = {
-        id: existing.id,
-        email: cleanEmail,
-        fullName: cleanName,
-        createdAt: existing.created_at || new Date().toISOString(),
-        onboardingCompleted: false,
-        firstLoginCompleted: false,
-        loginCount: existing.login_count ?? 0
-      };
-      const accountProof = this.createAccountProof({
-        id: existing.id,
-        email: cleanEmail,
-        full_name: cleanName,
-        password_hash: hash,
-        password_salt: salt,
-        created_at: userObj.createdAt,
-        onboarding_completed: 0,
-        first_login_completed: 0,
-        login_count: userObj.loginCount
-      });
-      return {
-        token: '',
-        user: userObj,
-        accountProof
-      };
+      throw new Error('An account with this email already exists. Please sign in instead.');
     }
 
     const { hash, salt } = hashPassword(password);
     const userId = `usr_${crypto.randomUUID()}`;
     const createdAt = new Date().toISOString();
 
-    const insert = db.prepare(`
-      INSERT INTO users (id, email, password_hash, password_salt, full_name, created_at, onboarding_completed, first_login_completed, login_count)
-      VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
-    `);
-    insert.run(userId, cleanEmail, hash, salt, cleanName, createdAt);
-
-    if (supabaseClient) {
-      try {
-        await supabaseClient.auth.signUp({
-          email: cleanEmail,
-          password,
-          options: { data: { full_name: cleanName } }
-        });
-      } catch (sbErr) {
-        console.warn('Supabase mirror note:', sbErr);
-      }
-    }
-
-    const accountProof = this.createAccountProof({
+    const newRecord: StoredUserRecord = {
       id: userId,
       email: cleanEmail,
-      full_name: cleanName,
       password_hash: hash,
       password_salt: salt,
+      full_name: cleanName,
       created_at: createdAt,
       onboarding_completed: 0,
       first_login_completed: 0,
       login_count: 0
-    });
+    };
+
+    if (supabaseClient) {
+      try {
+        const { error } = await supabaseClient.auth.signUp({
+          email: cleanEmail,
+          password,
+          options: { data: { full_name: cleanName } }
+        });
+        if (error && /already registered|already exists/i.test(error.message)) {
+          throw new Error('An account with this email already exists. Please sign in instead.');
+        }
+      } catch (sbErr: unknown) {
+        if (sbErr instanceof Error && sbErr.message.includes('already exists')) {
+          throw sbErr;
+        }
+        console.warn('Supabase mirror note:', sbErr);
+      }
+    }
+
+    memoryStore.users[cleanEmail] = newRecord;
+    saveStoreToDisk();
+
+    const generatedProof = this.createAccountProof(newRecord);
 
     return {
       token: '',
-      accountProof,
+      accountProof: generatedProof,
       user: {
         id: userId,
         email: cleanEmail,
@@ -393,20 +367,10 @@ export class ServerAuthDatabase {
     accountProof?: string
   ): Promise<{ user: DbUser; token: string; isFirstLogin: boolean; accountProof: string }> {
     const cleanEmail = email.trim().toLowerCase();
+    loadStoreFromDisk();
     this.restoreAccountProofIfNeeded(accountProof);
 
-    let row = db.prepare('SELECT * FROM users WHERE email = ?').get(cleanEmail) as {
-      id: string;
-      email: string;
-      password_hash: string;
-      password_salt: string;
-      full_name: string;
-      created_at: string;
-      onboarding_completed: number;
-      first_login_completed?: number;
-      login_count?: number;
-    } | undefined;
-
+    let row = memoryStore.users[cleanEmail];
     let isValid = false;
 
     if (row) {
@@ -426,22 +390,27 @@ export class ServerAuthDatabase {
           const cleanName = data?.user?.user_metadata?.full_name || row?.full_name || cleanEmail.split('@')[0];
           const createdAt = data?.user?.created_at || row?.created_at || new Date().toISOString();
 
-          if (row) {
-            db.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?').run(hash, salt, row.id);
-          } else {
-            db.prepare(`
-              INSERT INTO users (id, email, password_hash, password_salt, full_name, created_at, onboarding_completed, first_login_completed, login_count)
-              VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
-            `).run(userId, cleanEmail, hash, salt, cleanName, createdAt);
-          }
-
-          row = db.prepare('SELECT * FROM users WHERE email = ?').get(cleanEmail) as typeof row;
+          row = {
+            id: userId,
+            email: cleanEmail,
+            password_hash: hash,
+            password_salt: salt,
+            full_name: cleanName,
+            created_at: createdAt,
+            onboarding_completed: row?.onboarding_completed ?? 0,
+            first_login_completed: row?.first_login_completed ?? 0,
+            login_count: row?.login_count ?? 0
+          };
+          memoryStore.users[cleanEmail] = row;
+          saveStoreToDisk();
           isValid = true;
         } else if (error && error.code === 'invalid_credentials') {
-          throw new Error('Incorrect password. Please verify your credentials or click "Forgot password?".');
+          if (row) {
+            throw new Error('Invalid password. Please check your credentials or click "Forgot password?".');
+          }
         }
       } catch (sbErr: unknown) {
-        if (sbErr instanceof Error && sbErr.message.includes('Incorrect password')) {
+        if (sbErr instanceof Error && sbErr.message.includes('Invalid password')) {
           throw sbErr;
         }
         console.warn('Supabase bridge error:', sbErr);
@@ -460,7 +429,8 @@ export class ServerAuthDatabase {
     const isFirstLogin = prevLoginCount === 0 || !Boolean(row.first_login_completed);
     const newLoginCount = prevLoginCount + 1;
 
-    db.prepare('UPDATE users SET login_count = ? WHERE id = ?').run(newLoginCount, row.id);
+    row.login_count = newLoginCount;
+    memoryStore.users[cleanEmail] = row;
 
     const user: DbUser = {
       id: row.id,
@@ -479,19 +449,15 @@ export class ServerAuthDatabase {
       exp: expires.getTime()
     } satisfies SignedSessionPayload);
 
-    try {
-      db.prepare(`
-        INSERT OR REPLACE INTO sessions (token, user_id, created_at, expires_at)
-        VALUES (?, ?, ?, ?)
-      `).run(token, row.id, now.toISOString(), expires.toISOString());
-    } catch {
-      // Stateless token still valid if SQLite session insert is skipped
-    }
+    memoryStore.sessions[token] = {
+      token,
+      user_id: row.id,
+      created_at: now.toISOString(),
+      expires_at: expires.toISOString()
+    };
+    saveStoreToDisk();
 
-    const updatedAccountProof = this.createAccountProof({
-      ...row,
-      login_count: newLoginCount
-    });
+    const updatedAccountProof = this.createAccountProof(row);
 
     return {
       token,
@@ -502,41 +468,27 @@ export class ServerAuthDatabase {
   }
 
   /**
-   * Validate session token (supports both SQLite session lookup and stateless HMAC token verification across serverless cold starts)
+   * Validate session token (supports both local store lookup and stateless HMAC token verification across serverless cold starts)
    */
   static validateSession(token: string): DbUser | null {
     if (!token || revokedTokens.has(token)) return null;
+    loadStoreFromDisk();
     const nowIso = new Date().toISOString();
 
-    try {
-      const row = db.prepare(`
-        SELECT u.id, u.email, u.full_name, u.created_at, u.onboarding_completed, u.first_login_completed, u.login_count
-        FROM sessions s
-        JOIN users u ON s.user_id = u.id
-        WHERE s.token = ? AND s.expires_at > ?
-      `).get(token, nowIso) as {
-        id: string;
-        email: string;
-        full_name: string;
-        created_at: string;
-        onboarding_completed: number;
-        first_login_completed?: number;
-        login_count?: number;
-      } | undefined;
-
-      if (row) {
+    const session = memoryStore.sessions[token];
+    if (session && session.expires_at > nowIso) {
+      const userRow = findUserById(session.user_id);
+      if (userRow) {
         return {
-          id: row.id,
-          email: row.email,
-          fullName: row.full_name,
-          createdAt: row.created_at,
-          onboardingCompleted: Boolean(row.onboarding_completed),
-          firstLoginCompleted: Boolean(row.first_login_completed),
-          loginCount: row.login_count ?? 1
+          id: userRow.id,
+          email: userRow.email,
+          fullName: userRow.full_name,
+          createdAt: userRow.created_at,
+          onboardingCompleted: Boolean(userRow.onboarding_completed),
+          firstLoginCompleted: Boolean(userRow.first_login_completed),
+          loginCount: userRow.login_count ?? 1
         };
       }
-    } catch {
-      // Fall through to stateless HMAC verification
     }
 
     const stateless = verifySignedPayload<SignedSessionPayload>(token, 'qws1');
@@ -553,10 +505,10 @@ export class ServerAuthDatabase {
   static logout(token: string): void {
     if (!token) return;
     revokedTokens.add(token);
-    try {
-      db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
-    } catch {
-      // Ignore if session not in local instance
+    loadStoreFromDisk();
+    if (memoryStore.sessions[token]) {
+      delete memoryStore.sessions[token];
+      saveStoreToDisk();
     }
   }
 
@@ -565,17 +517,25 @@ export class ServerAuthDatabase {
    */
   static async requestPasswordReset(email: string, accountProof?: string): Promise<{ code: string }> {
     const cleanEmail = email.trim().toLowerCase();
+    loadStoreFromDisk();
     this.restoreAccountProofIfNeeded(accountProof);
-    let user = db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
+    let user = memoryStore.users[cleanEmail];
 
     if (!user && supabaseClient) {
       const userId = `usr_${crypto.randomUUID()}`;
       const { hash, salt } = hashPassword('temp-reset-password');
-      db.prepare(`
-        INSERT INTO users (id, email, password_hash, password_salt, full_name, created_at, onboarding_completed, first_login_completed, login_count)
-        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
-      `).run(userId, cleanEmail, hash, salt, cleanEmail.split('@')[0], new Date().toISOString());
-      user = { id: userId };
+      user = {
+        id: userId,
+        email: cleanEmail,
+        password_hash: hash,
+        password_salt: salt,
+        full_name: cleanEmail.split('@')[0],
+        created_at: new Date().toISOString(),
+        onboarding_completed: 0,
+        first_login_completed: 0,
+        login_count: 0
+      };
+      memoryStore.users[cleanEmail] = user;
     }
 
     if (!user) {
@@ -585,10 +545,12 @@ export class ServerAuthDatabase {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-    db.prepare(`
-      INSERT OR REPLACE INTO password_resets (email, code, expires_at)
-      VALUES (?, ?, ?)
-    `).run(cleanEmail, code, expires);
+    memoryStore.passwordResets[cleanEmail] = {
+      email: cleanEmail,
+      code,
+      expires_at: expires
+    };
+    saveStoreToDisk();
 
     return { code };
   }
@@ -596,19 +558,17 @@ export class ServerAuthDatabase {
   /**
    * Reset password
    */
-  static async resetPassword(email: string, newPassword: string, code?: string, accountProof?: string): Promise<{ accountProof: string }> {
+  static async resetPassword(
+    email: string,
+    newPassword: string,
+    code?: string,
+    accountProof?: string
+  ): Promise<{ accountProof: string }> {
     const cleanEmail = email.trim().toLowerCase();
+    loadStoreFromDisk();
     this.restoreAccountProofIfNeeded(accountProof);
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(cleanEmail) as {
-      id: string;
-      email: string;
-      full_name: string;
-      created_at: string;
-      onboarding_completed: number;
-      first_login_completed?: number;
-      login_count?: number;
-    } | undefined;
+    const user = memoryStore.users[cleanEmail];
     if (!user) {
       throw new Error('No account found with this email address.');
     }
@@ -618,30 +578,20 @@ export class ServerAuthDatabase {
     }
 
     if (code) {
-      const reset = db.prepare(`
-        SELECT * FROM password_resets
-        WHERE email = ? AND code = ? AND expires_at > ?
-      `).get(cleanEmail, code, new Date().toISOString());
-
-      if (!reset) {
+      const reset = memoryStore.passwordResets[cleanEmail];
+      if (!reset || reset.code !== code || reset.expires_at <= new Date().toISOString()) {
         throw new Error('Invalid or expired verification code.');
       }
     }
 
     const { hash, salt } = hashPassword(newPassword);
-    db.prepare(`
-      UPDATE users
-      SET password_hash = ?, password_salt = ?
-      WHERE email = ?
-    `).run(hash, salt, cleanEmail);
+    user.password_hash = hash;
+    user.password_salt = salt;
+    memoryStore.users[cleanEmail] = user;
+    delete memoryStore.passwordResets[cleanEmail];
+    saveStoreToDisk();
 
-    db.prepare('DELETE FROM password_resets WHERE email = ?').run(cleanEmail);
-
-    const newProof = this.createAccountProof({
-      ...user,
-      password_hash: hash,
-      password_salt: salt
-    });
+    const newProof = this.createAccountProof(user);
     return { accountProof: newProof };
   }
 
@@ -650,17 +600,7 @@ export class ServerAuthDatabase {
    */
   static updateProfile(userId: string, fullName: string): DbUser {
     const cleanName = fullName.trim();
-    db.prepare('UPDATE users SET full_name = ? WHERE id = ?').run(cleanName, userId);
-
-    const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as {
-      id: string;
-      email: string;
-      full_name: string;
-      created_at: string;
-      onboarding_completed: number;
-      first_login_completed?: number;
-      login_count?: number;
-    } | undefined;
+    const updated = findUserById(userId);
 
     if (!updated) {
       return {
@@ -673,6 +613,10 @@ export class ServerAuthDatabase {
         loginCount: 1
       };
     }
+
+    updated.full_name = cleanName;
+    memoryStore.users[updated.email] = updated;
+    saveStoreToDisk();
 
     return {
       id: updated.id,
@@ -689,10 +633,12 @@ export class ServerAuthDatabase {
    * Mark onboarding and first login as completed
    */
   static completeOnboarding(userId: string): void {
-    try {
-      db.prepare('UPDATE users SET onboarding_completed = 1, first_login_completed = 1 WHERE id = ?').run(userId);
-    } catch {
-      // Ignore on stateless instance
+    const user = findUserById(userId);
+    if (user) {
+      user.onboarding_completed = 1;
+      user.first_login_completed = 1;
+      memoryStore.users[user.email] = user;
+      saveStoreToDisk();
     }
   }
 
@@ -700,10 +646,12 @@ export class ServerAuthDatabase {
    * Mark first login as completed
    */
   static completeFirstLogin(userId: string): void {
-    try {
-      db.prepare('UPDATE users SET first_login_completed = 1, onboarding_completed = 1 WHERE id = ?').run(userId);
-    } catch {
-      // Ignore on stateless instance
+    const user = findUserById(userId);
+    if (user) {
+      user.first_login_completed = 1;
+      user.onboarding_completed = 1;
+      memoryStore.users[user.email] = user;
+      saveStoreToDisk();
     }
   }
 }

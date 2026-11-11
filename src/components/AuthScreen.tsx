@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { UserProfile } from '../types';
 import { PersistenceService } from '../lib/supabase';
-import { apiUrl } from '../lib/api';
+import { apiUrl, parseApiResponse } from '../lib/api';
 import { Database, ShieldCheck, Mail, Lock, User, ArrowRight, CheckCircle2, AlertCircle, KeyRound, Sparkles } from 'lucide-react';
 
 interface AuthScreenProps {
@@ -88,10 +88,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthSuccess }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: cleanEmail, password, accountProof })
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to sign in. Please verify your credentials.');
-      }
+      const data = await parseApiResponse(res, 'Failed to sign in. Please verify your credentials.');
 
       if (data.accountProof) {
         saveStoredAccountProof(cleanEmail, data.accountProof);
@@ -128,19 +125,18 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthSuccess }) => {
 
     try {
       const cleanEmail = email.trim();
+      const existingProof = getStoredAccountProof(cleanEmail);
       const res = await fetch(apiUrl('/api/auth/register'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: cleanEmail,
           password,
-          fullName: fullName.trim()
+          fullName: fullName.trim(),
+          accountProof: existingProof
         })
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to create account.');
-      }
+      const data = await parseApiResponse(res, 'Failed to create account.');
 
       if (data.accountProof) {
         saveStoredAccountProof(cleanEmail, data.accountProof);
@@ -178,10 +174,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthSuccess }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: cleanEmail, accountProof })
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to authorize password reset.');
-      }
+      await parseApiResponse(res, 'Failed to authorize password reset.');
       setSuccessMessage('Password reset authorized. Enter your new password below.');
       setMode('reset');
     } catch (err: unknown) {
@@ -215,10 +208,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthSuccess }) => {
           accountProof
         })
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to reset password.');
-      }
+      const data = await parseApiResponse(res, 'Failed to reset password.');
       if (data.accountProof) {
         saveStoredAccountProof(cleanEmail, data.accountProof);
       }

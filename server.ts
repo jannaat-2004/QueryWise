@@ -21,6 +21,34 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+// Normalize incoming URL paths for Vercel Serverless Function rewrites and reverse proxies
+app.use((req: Request, _res: Response, next) => {
+  try {
+    const parsedUrl = new URL(req.url, 'http://localhost');
+    const forwardedPath = parsedUrl.searchParams.get('__pathname');
+    if (forwardedPath) {
+      parsedUrl.searchParams.delete('__pathname');
+      const search = parsedUrl.searchParams.toString();
+      const normalized = forwardedPath.startsWith('/') ? forwardedPath : `/${forwardedPath}`;
+      const apiPath = normalized.startsWith('/api/') ? normalized : `/api${normalized}`;
+      req.url = `${apiPath}${search ? `?${search}` : ''}`;
+    } else if (!req.url.startsWith('/api/') && !req.url.startsWith('/api?')) {
+      const clean = req.url.startsWith('/') ? req.url : `/${req.url}`;
+      if (
+        clean.startsWith('/health') ||
+        clean.startsWith('/auth/') ||
+        clean.startsWith('/chat/') ||
+        clean.startsWith('/sql/')
+      ) {
+        req.url = `/api${clean}`;
+      }
+    }
+  } catch {
+    // Keep original req.url if URL parsing fails
+  }
+  next();
+});
+
 // Production CORS middleware (supports same-origin Vercel deployment as well as split frontend/backend hosting)
 app.use((req: Request, res: Response, next) => {
   const allowedOrigin = process.env.CORS_ORIGIN || req.headers.origin || '*';
@@ -148,16 +176,21 @@ app.get('/api/health', (req: Request, res: Response) => {
 // Register new account
 app.post('/api/auth/register', async (req: Request, res: Response) => {
   try {
-    const { email, password, fullName } = req.body;
-    if (!email || !email.includes('@')) {
+    const { email, password, fullName, accountProof: existingProof } = req.body || {};
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
       res.status(400).json({ error: 'Valid email address is required.' });
       return;
     }
-    if (!password || password.length < 6) {
+    if (!password || typeof password !== 'string' || password.length < 6) {
       res.status(400).json({ error: 'Password must be at least 6 characters long.' });
       return;
     }
-    const { user, accountProof } = await ServerAuthDatabase.register(email, password, fullName || '');
+    const { user, accountProof } = await ServerAuthDatabase.register(
+      email,
+      password,
+      typeof fullName === 'string' ? fullName : '',
+      typeof existingProof === 'string' ? existingProof : undefined
+    );
     res.status(201).json({
       success: true,
       message: 'Account created successfully! Please sign in with your credentials.',
@@ -174,7 +207,7 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
 // Sign In
 app.post('/api/auth/login', async (req: Request, res: Response) => {
   try {
-    const { email, password, accountProof } = req.body;
+    const { email, password, accountProof } = req.body || {};
     if (!email || !password) {
       res.status(400).json({ error: 'Email and password are required.' });
       return;
@@ -2441,13 +2474,30 @@ function generateBasicKPIs(columns: string[], rows: (string | number | boolean |
   return kpis;
 }
 
+// Structured JSON 404 handler for any unmatched /api/* route
+app.all('/api/*', (req: Request, res: Response) => {
+  res.status(404).json({
+    error: `API route not found: ${req.method} ${req.path}`
+  });
+});
+
+// Global Express JSON error-handling middleware so API clients never receive HTML/plain-text error pages
+app.use((err: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
+  const msg = err instanceof Error ? err.message : 'Internal server error';
+  console.error('Unhandled API Error:', err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: msg });
+  }
+});
+
 // Full-stack Vite setup
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (!isProduction) {
     // Development mode: mount Vite dev server as middleware
-    const { createServer: createViteServer } = await import('vite');
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(/* @vite-ignore */ vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
@@ -2467,12 +2517,18 @@ async function startServer() {
   });
 }
 
-// Export Express app for Vercel Serverless Functions (api/index.ts)
+// Export Express app for Vercel Serverless Functions
 export { app };
 export default app;
 
-// Only start standalone HTTP listener when not running as a Vercel Serverless Function
-if (!process.env.VERCEL) {
+// Only start standalone HTTP listener when not running as a Serverless Function
+const isServerlessRuntime = Boolean(
+  process.env.VERCEL ||
+  process.env.VERCEL_ENV ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME
+);
+
+if (!isServerlessRuntime) {
   startServer().catch(err => {
     console.error('Failed to start server:', err);
   });
